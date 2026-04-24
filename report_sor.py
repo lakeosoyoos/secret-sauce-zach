@@ -139,8 +139,11 @@ def build_report_sor(folder, title, out_pdf):
     interior_start = _LAUNCH_SKIP_M
     interior_end = min_L - _END_BUFFER_M
     if interior_end - interior_start < 100:
-        interior_start = max(50.0, min_L * 0.05)
-        interior_end = min_L * 0.95
+        # Short-fiber fallback: scale the window to the span itself.
+        # 2 m floor keeps the launch buffer sane for coils under 50 m; for
+        # anything longer, 5% of the span is plenty.
+        interior_start = max(2.0, min_L * 0.05)
+        interior_end = max(interior_start + 2.0, min_L * 0.95)
     print(f'Interior window: {interior_start:.0f}–{interior_end:.0f} m  '
           f'(common span {min_L:.0f} m)')
 
