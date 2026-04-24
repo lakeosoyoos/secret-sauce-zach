@@ -1,0 +1,25 @@
+# Generated outputs
+report.html
+report.pdf
+*.html
+*.pdf
+
+# Sample/test data (don't publish customer traces)
+data/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# macOS
+.DS_Store
+._*
+
+# Local streamlit secrets
+.streamlit/secrets.toml
+
+# Temp
+*.tmp
