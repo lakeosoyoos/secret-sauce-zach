@@ -21,7 +21,7 @@ from sor_reader324802a import parse_sor_full
 
 from report import (  # reuse helpers — all neutral
     _BASE_CSS, _embed_logo, _find_chrome, _outlier_probability,
-    html_to_pdf_bytes, _fmt_time_gap,
+    html_to_pdf_bytes, _fmt_time_gap, _detrend, _shape_color,
     _COLOR_HIGH, _COLOR_MID, _COLOR_LOW,
 )
 
@@ -70,6 +70,23 @@ def _pair_score(a, b, interior_start, interior_end):
     if mask.sum() < 50:
         return None
     return float(np.std(ta[:n][mask] - tb[:n][mask]))
+
+
+def _pair_shape_r(a, b, interior_start, interior_end):
+    """Detrended Pearson r in the interior window. r ≈ 1 → same fiber."""
+    pa = a['pos']
+    ta, tb = a['trace'], b['trace']
+    n = min(len(ta), len(tb))
+    mask = (pa[:n] > interior_start) & (pa[:n] < interior_end)
+    if mask.sum() < 50:
+        return None
+    pp = pa[:n][mask].astype(np.float64)
+    da = _detrend(ta[:n][mask].astype(np.float64), pp)
+    db = _detrend(tb[:n][mask].astype(np.float64), pp)
+    sa, sb = np.std(da), np.std(db)
+    if sa == 0 or sb == 0:
+        return None
+    return float(np.dot(da - da.mean(), db - db.mean()) / (sa * sb * len(da)))
 
 
 def _distribution_chart(scores, p_dup, stats):
@@ -152,7 +169,8 @@ def build_report_sor(folder, title, out_pdf):
         s = _pair_score(a, b, interior_start, interior_end)
         if s is None:
             continue
-        pairs.append({'a': a['name'], 'b': b['name'], 'score': s})
+        r = _pair_shape_r(a, b, interior_start, interior_end)
+        pairs.append({'a': a['name'], 'b': b['name'], 'score': s, 'shape_r': r})
     if not pairs:
         raise RuntimeError('No comparable pairs after interior masking')
 
@@ -199,11 +217,15 @@ def build_report_sor(folder, title, out_pdf):
                         if pd_val > 0.5 else
                         f'<span class="na">unique (closest: {partner})</span>')
         loss_cell = f'{f["loss"]:.3f}' if f['loss'] is not None else '—'
+        r_val = bp.get('shape_r')
+        r_cell = ('<td class="center na">—</td>' if r_val is None else
+                  f'<td class="center" style="color:{_shape_color(r_val)};font-weight:600">{r_val:.4f}</td>')
         file_rows += (f'<tr><td class="pair-cell">{f["name"]}</td>'
                       f'<td class="center">{f["length"]/1000:.3f}</td>'
                       f'<td class="center">{loss_cell}</td>'
                       f'<td class="center">{bp["score"]:.4f}</td>'
                       f'<td class="center" style="color:{pd_color};font-weight:600">{pd_val*100:.2f}%</td>'
+                      f'{r_cell}'
                       f'<td class="center">{verdict_cell}</td></tr>')
 
     top_rows = ''
@@ -211,10 +233,14 @@ def build_report_sor(folder, title, out_pdf):
         p = pairs[k]
         pd_val = p['p_dup']
         pd_color = '#2d8f48' if pd_val > 0.9 else ('#b97000' if pd_val > 0.1 else '#888')
+        r_val = p.get('shape_r')
+        r_cell = ('<td class="center na">—</td>' if r_val is None else
+                  f'<td class="center" style="color:{_shape_color(r_val)};font-weight:600">{r_val:.4f}</td>')
         top_rows += (f'<tr><td class="center">{rank}</td>'
                      f'<td class="pair-cell">{p["a"]} ↔ {p["b"]}</td>'
                      f'<td class="center">{p["score"]:.4f}</td>'
-                     f'<td class="center" style="color:{pd_color};font-weight:600">{pd_val*100:.2f}%</td></tr>')
+                     f'<td class="center" style="color:{pd_color};font-weight:600">{pd_val*100:.2f}%</td>'
+                     f'{r_cell}</tr>')
 
     # Confirmed-duplicate detail table (p_dup > 0.5)
     file_by_name = {f['name']: f for f in files}
@@ -237,9 +263,12 @@ def build_report_sor(folder, title, out_pdf):
                    else '<td class="center na">—</td>')
         pd_val = p['p_dup']
         pd_color = '#2d8f48' if pd_val > 0.9 else '#b97000'
+        r_val = p.get('shape_r')
+        r_cell = ('<td class="center na">—</td>' if r_val is None else
+                  f'<td class="center" style="color:{_shape_color(r_val)};font-weight:600">{r_val:.4f}</td>')
         dup_detail_rows += (f'<tr><td class="pair-cell">{p["a"]} ↔ {p["b"]}</td>'
                             f'<td class="center">{gap_str}</td>'
-                            f'{ms_cell}{sl_cell}'
+                            f'{ms_cell}{sl_cell}{r_cell}'
                             f'<td class="center" style="color:{pd_color};font-weight:600">{pd_val*100:.2f}%</td></tr>')
     dup_detail_block = ''
     if dup_detail_rows:
@@ -249,7 +278,7 @@ def build_report_sor(folder, title, out_pdf):
 <table class="vote-table">
 <tr><th style="text-align:left">Pair</th><th>Time gap</th>
   <th>max splice Δ (mdB)</th><th>span loss Δ (mdB)</th>
-  <th>Duplicate likelihood</th></tr>
+  <th>shape r</th><th>Duplicate likelihood</th></tr>
 {dup_detail_rows}
 </table>
 '''
@@ -283,14 +312,15 @@ def build_report_sor(folder, title, out_pdf):
 <table class="vote-table">
 <tr><th style="text-align:left">File</th>
     <th>Length (km)</th><th>Span loss (dB)</th>
-    <th>best-match score</th><th>Duplicate likelihood</th><th>Verdict</th></tr>
+    <th>best-match score</th><th>Duplicate likelihood</th>
+    <th>shape r</th><th>Verdict</th></tr>
 {file_rows}
 </table>
 
 <div class="dir-banner">Top 30 pairs — tightest match score</div>
 <table class="vote-table">
 <tr><th>Rank</th><th style="text-align:left">Pair</th>
-    <th>match score</th><th>Duplicate likelihood</th></tr>
+    <th>match score</th><th>Duplicate likelihood</th><th>shape r</th></tr>
 {top_rows}
 </table>
 {dup_detail_block}

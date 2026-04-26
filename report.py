@@ -116,6 +116,63 @@ def _score(a, b, wl):
     return float(np.std(ta[:n][mask] - tb[:n][mask]))
 
 
+def _detrend(trace, pos):
+    """Subtract best-fit linear (offset + slope) so two traces with different
+    launch power / attenuation gain can still be shape-compared."""
+    A = np.vstack([pos, np.ones_like(pos)]).T
+    m, c = np.linalg.lstsq(A, trace, rcond=None)[0]
+    return trace - (m * pos + c)
+
+
+def _interior_mask(pos, length_m=None):
+    """Pick an interior window that works for both km-scale fibers and short
+    coils. For short fibers (< 800 m), use a 1 m launch buffer + 5% end
+    buffer — anything tighter on coils discards the very fiber region we
+    want to compare. For long fibers, use the production 1100–60000 m window."""
+    if length_m is not None and length_m > 0 and length_m < 800:
+        lo = max(1.0, length_m * 0.03)
+        hi = max(lo + 1.0, length_m - max(0.5, length_m * 0.03))
+    else:
+        lo, hi = _INTERIOR_MIN_M, _INTERIOR_MAX_M
+    return (pos > lo) & (pos < hi)
+
+
+def _shape_r(a, b, wl):
+    """Detrended Pearson correlation between two traces at one wavelength.
+    Returns r in [-1, 1] or None if insufficient samples. r ≈ 1 → same fiber."""
+    if wl not in a['wl'] or wl not in b['wl']:
+        return None
+    ta, tb = a['wl'][wl]['trace'], b['wl'][wl]['trace']
+    pa = a['wl'][wl]['pos']
+    L = min(a['wl'][wl].get('length_m') or 0, b['wl'][wl].get('length_m') or 0) or None
+    n = min(len(ta), len(tb))
+    mask = _interior_mask(pa[:n], length_m=L)
+    if mask.sum() < 50:
+        return None
+    da = _detrend(ta[:n][mask].astype(np.float64), pa[:n][mask])
+    db = _detrend(tb[:n][mask].astype(np.float64), pa[:n][mask])
+    sa, sb = np.std(da), np.std(db)
+    if sa == 0 or sb == 0:
+        return None
+    return float(np.dot(da - da.mean(), db - db.mean()) / (sa * sb * len(da)))
+
+
+def _shape_tier(r):
+    """Bin a Pearson r into a same-fiber tier."""
+    if r is None:
+        return None
+    if r >= 0.99:
+        return 'high'
+    if r >= 0.95:
+        return 'mid'
+    return 'low'
+
+
+def _shape_color(r):
+    t = _shape_tier(r)
+    return _COLOR_HIGH if t == 'high' else (_COLOR_MID if t == 'mid' else _COLOR_LOW)
+
+
 def _find_chrome():
     for p in ['/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
               '/usr/bin/google-chrome', '/usr/bin/chromium-browser']:
@@ -388,11 +445,17 @@ def build_report(files, all_pairs_list, truth_dups, out_path, title='Duplicate C
                 wl_cells += f'<td class="center" style="color:{color};font-weight:600">{sc:.4f}</td>'
         pd_val = bp['pair']['p_dup']
         pd_color = '#2d8f48' if pd_val > 0.9 else ('#b97000' if pd_val > 0.1 else '#888')
+        r_min = bp['pair'].get('r_min')
+        if r_min is None:
+            r_cell = '<td class="center na">—</td>'
+        else:
+            r_cell = f'<td class="center" style="color:{_shape_color(r_min)};font-weight:600">{r_min:.4f}</td>'
         file_rows += (f'<tr><td class="pair-cell">{f["name"]}</td>'
                       f'<td class="center">{f["test_dt"][:19]}</td>'
                       f'{wl_cells}'
                       f'<td class="center">{bp["sum_score"]:.3f}</td>'
                       f'<td class="center" style="color:{pd_color};font-weight:600">{pd_val*100:.2f}%</td>'
+                      f'{r_cell}'
                       f'{verdict_html}</tr>')
 
     # ---- Confirmed-duplicate detail table (pairs with P(dup) > 0.5) -----
@@ -411,9 +474,10 @@ def build_report(files, all_pairs_list, truth_dups, out_path, title='Duplicate C
             gap_str = _fmt_time_gap(gap_sec)
         else:
             gap_str = '—'
-        # Per-wavelength cells: max splice-loss Δ (mdB) + span-loss Δ (mdB)
+        # Per-wavelength cells: max splice-loss Δ (mdB), span-loss Δ (mdB), shape r
         ms_cells = ''
         sl_cells = ''
+        sr_cells = ''
         for wl in WL_ORDER:
             a_ms = fa['wl'].get(wl, {}).get('max_splice_dB')
             b_ms = fb['wl'].get(wl, {}).get('max_splice_dB')
@@ -427,21 +491,28 @@ def build_report(files, all_pairs_list, truth_dups, out_path, title='Duplicate C
                 sl_cells += f'<td class="center">{abs(a_sl - b_sl)*1000:.0f}</td>'
             else:
                 sl_cells += '<td class="center na">—</td>'
+            r_wl = (p.get('shape_r') or {}).get(wl)
+            if r_wl is None:
+                sr_cells += '<td class="center na">—</td>'
+            else:
+                sr_cells += (f'<td class="center" style="color:{_shape_color(r_wl)};'
+                             f'font-weight:600">{r_wl:.4f}</td>')
         pd_val = p['p_dup']
         pd_color = '#2d8f48' if pd_val > 0.9 else '#b97000'
         dup_detail_rows += (f'<tr><td class="pair-cell">{p["a"]} ↔ {p["b"]}</td>'
                             f'<td class="center">{gap_str}</td>'
-                            f'{ms_cells}{sl_cells}'
+                            f'{ms_cells}{sl_cells}{sr_cells}'
                             f'<td class="center" style="color:{pd_color};font-weight:600">{pd_val*100:.2f}%</td></tr>')
     dup_detail_block = ''
     if dup_detail_rows:
         ms_hdrs = ''.join(f'<th>max splice Δ @ {wl} (mdB)</th>' for wl in WL_ORDER)
         sl_hdrs = ''.join(f'<th>span loss Δ @ {wl} (mdB)</th>' for wl in WL_ORDER)
+        sr_hdrs = ''.join(f'<th>shape r @ {wl}</th>' for wl in WL_ORDER)
         dup_detail_block = f'''
 <div class="dir-banner">Confirmed duplicate pairs (≥50% likelihood) — detail</div>
 <table class="vote-table">
 <tr><th style="text-align:left">Pair</th><th>Time gap</th>
-  {ms_hdrs}{sl_hdrs}<th>Duplicate likelihood</th></tr>
+  {ms_hdrs}{sl_hdrs}{sr_hdrs}<th>Duplicate likelihood</th></tr>
 {dup_detail_rows}
 </table>
 '''
@@ -461,10 +532,14 @@ def build_report(files, all_pairs_list, truth_dups, out_path, title='Duplicate C
                 wl_cells += '<td class="center na">---</td>'
         pd_val = p['p_dup']
         pd_color = '#2d8f48' if pd_val > 0.9 else ('#b97000' if pd_val > 0.1 else '#888')
+        r_min = p.get('r_min')
+        r_cell = ('<td class="center na">—</td>' if r_min is None else
+                  f'<td class="center" style="color:{_shape_color(r_min)};font-weight:600">{r_min:.4f}</td>')
         nondup_rows += (f'<tr><td class="pair-cell">{p["a"]} ↔ {p["b"]}</td>'
                         f'{wl_cells}'
                         f'<td class="center">{p["sum_score"]:.3f}</td>'
-                        f'<td class="center" style="color:{pd_color};font-weight:600">{pd_val*100:.2f}%</td></tr>')
+                        f'<td class="center" style="color:{pd_color};font-weight:600">{pd_val*100:.2f}%</td>'
+                        f'{r_cell}</tr>')
 
     n_over_50 = int((p_dup_arr > 0.5).sum())
     n_over_99 = int((p_dup_arr > 0.99).sum())
@@ -523,7 +598,8 @@ def build_report(files, all_pairs_list, truth_dups, out_path, title='Duplicate C
 <table class="vote-table">
 <tr><th style="text-align:left">File</th><th>Acquisition time</th>
   <th>score @ 1310</th><th>score @ 1550</th><th>score @ 1625</th>
-  <th>combined score</th><th>Duplicate likelihood</th><th>Verdict</th></tr>
+  <th>combined score</th><th>Duplicate likelihood</th>
+  <th>shape r (min λ)</th><th>Verdict</th></tr>
 {file_rows}
 </table>
 
@@ -533,7 +609,7 @@ def build_report(files, all_pairs_list, truth_dups, out_path, title='Duplicate C
 <table class="vote-table">
 <tr><th style="text-align:left">Pair</th>
   <th>score @ 1310</th><th>score @ 1550</th><th>score @ 1625</th><th>combined</th>
-  <th>Duplicate likelihood</th></tr>
+  <th>Duplicate likelihood</th><th>shape r (min λ)</th></tr>
 {nondup_rows}
 </table>
 
@@ -607,10 +683,14 @@ def build_json_html(folder, title='Duplicate Classification Report', truth_dups=
     all_pairs = []
     for a, b in combinations(files, 2):
         sc = {wl: _score(a, b, wl) for wl in WL_ORDER}
+        rs = {wl: _shape_r(a, b, wl) for wl in WL_ORDER}
         sum_sc = sum(v for v in sc.values() if v is not None)
+        rs_vals = [v for v in rs.values() if v is not None]
+        r_min = min(rs_vals) if rs_vals else None
         is_dup = tuple(sorted([a['name'], b['name']])) in (truth_dups or set())
         all_pairs.append({'a': a['name'], 'b': b['name'],
-                          'score': sc, 'sum_score': sum_sc, 'is_dup': is_dup})
+                          'score': sc, 'sum_score': sum_sc, 'is_dup': is_dup,
+                          'shape_r': rs, 'r_min': r_min})
     out_html_tmp = os.path.join(folder, '_tmp_report.html')
     build_report(files, all_pairs, truth_dups or set(), out_html_tmp, title=title)
     with open(out_html_tmp, 'r', encoding='utf-8') as fh:
