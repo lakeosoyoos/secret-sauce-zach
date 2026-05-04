@@ -20,7 +20,7 @@ import streamlit as st
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 
-from report import run_json_bytes
+from report import run_json_bytes, run_trc_bytes
 from report_sor import run_sor_bytes
 
 
@@ -64,8 +64,8 @@ if "uploader_key" not in st.session_state:
     st.session_state["uploader_key"] = 0
 
 uploads = st.file_uploader(
-    "Drop .sor, .json files and/or a .zip here",
-    type=["sor", "json", "zip"],
+    "Drop .sor, .trc, .json files and/or a .zip here",
+    type=["sor", "trc", "json", "zip"],
     accept_multiple_files=True,
     key=f"uploader_{st.session_state['uploader_key']}",
 )
@@ -99,7 +99,8 @@ def _stage(uf, dest_dir):
                 if not inner or inner.startswith("._") or inner == ".DS_Store":
                     continue
                 low = inner.lower()
-                if not (low.endswith(".sor") or low.endswith(".json")):
+                if not (low.endswith(".sor") or low.endswith(".trc")
+                        or low.endswith(".json")):
                     continue
                 dst = os.path.join(dest_dir, inner)
                 with zf.open(info) as src, open(dst, "wb") as out:
@@ -118,17 +119,18 @@ for uf in uploads:
     saved.extend(_stage(uf, tmp_dir))
 
 sor_files = [p for p in saved if p.lower().endswith(".sor")]
+trc_files = [p for p in saved if p.lower().endswith(".trc")]
 json_files = [p for p in saved if p.lower().endswith(".json")]
 
-if not sor_files and not json_files:
-    st.error("No .sor or .json files found in the uploads.")
+n_kinds = sum(bool(x) for x in (sor_files, trc_files, json_files))
+if n_kinds == 0:
+    st.error("No .sor, .trc, or .json files found in the uploads.")
+    st.stop()
+if n_kinds > 1:
+    st.error("Mixed file types found. Upload one of .sor / .trc / .json at a time.")
     st.stop()
 
-if sor_files and json_files:
-    st.error("Mixed .sor and .json found. Upload one type at a time.")
-    st.stop()
-
-st.success(f"Loaded {len(sor_files)} SOR + {len(json_files)} JSON file(s).")
+st.success(f"Loaded {len(sor_files)} SOR + {len(trc_files)} TRC + {len(json_files)} JSON file(s).")
 
 
 # ----- SOR: group by direction prefix ----------------------------------
@@ -179,6 +181,16 @@ if sor_files:
                 st.error(f"{prefix}: {e}")
                 continue
         reports.append((fname, pdf_bytes, n_files, n_pairs, prefix))
+elif trc_files:
+    subdir = _copy_to_subdir(trc_files, os.path.join(tmp_dir, "trc_input"))
+    with st.spinner(f"Running Secret Sauce on {len(trc_files)} TRC files…"):
+        try:
+            pdf_bytes, n_files, n_pairs = run_trc_bytes(
+                subdir, title="Secret Sauce — Duplicate Classification")
+        except Exception as e:
+            st.error(str(e))
+            st.stop()
+    reports.append(("report.pdf", pdf_bytes, n_files, n_pairs, "TRC"))
 else:
     subdir = _copy_to_subdir(json_files, os.path.join(tmp_dir, "json_input"))
     with st.spinner(f"Running Secret Sauce on {len(json_files)} JSON files…"):

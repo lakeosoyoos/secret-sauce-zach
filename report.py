@@ -90,6 +90,47 @@ def load_file(path):
             'test_dt': dt_raw, 'test_epoch': dt_epoch, 'wl': per_wl}
 
 
+def load_trc_file(path):
+    """Parse a .trc file into the same per-file dict shape as load_file (JSON)."""
+    from trc_parser import parse_trc_file
+    r = parse_trc_file(path)
+    name = os.path.basename(path).split('_')[0].split('.')[0].strip()
+    per_wl = {}
+    IOR = 1.4682
+    for wlblock in r.get('wavelengths') or []:
+        wl_nm = int(wlblock['wavelength_nm'])
+        sp = wlblock.get('sampling_period_s')
+        if not sp:
+            continue
+        dz = 2.998e8 * sp / (2.0 * IOR)
+        samples = wlblock['samples']
+        trace = 64.0 - samples.astype(np.float64) / 1024.0
+        pos = np.arange(len(trace)) * dz
+        # Max interior splice loss from event table (skip end-of-fiber events)
+        events = wlblock.get('events') or []
+        spl_vals = [abs(e.get('loss_db'))
+                    for e in events
+                    if e.get('loss_db') is not None
+                    and (e.get('position_m') or 0) > 0.01
+                    and (str(e.get('type', '')).lower() != 'end')]
+        max_splice = max(spl_vals) if spl_vals else None
+        per_wl[wl_nm] = {
+            'trace': trace, 'pos': pos,
+            'max_splice_dB': max_splice,
+            'span_loss_dB': wlblock.get('span_loss_db'),
+            'length_m':     wlblock.get('length_m'),
+        }
+    ts = r.get('timestamp')
+    if ts:
+        from datetime import datetime as _dt
+        dt_raw = _dt.fromtimestamp(ts).isoformat()
+    else:
+        dt_raw = ''
+    return {'name': name, 'filepath': path,
+            'test_dt': dt_raw, 'test_epoch': float(ts) if ts else None,
+            'wl': per_wl}
+
+
 def _outlier_probability(values):
     """P(duplicate) per pair via robust-bulk fit + Bonferroni tail in log space."""
     v = np.asarray(values, dtype=np.float64)
@@ -110,8 +151,10 @@ def _score(a, b, wl):
     ta, tb = a['wl'][wl]['trace'], b['wl'][wl]['trace']
     pa = a['wl'][wl]['pos']
     n = min(len(ta), len(tb))
-    mask = (pa[:n] > _INTERIOR_MIN_M) & (pa[:n] < _INTERIOR_MAX_M)
-    if mask.sum() < 100:
+    # Use length-aware interior window so short coils aren't discarded
+    length_m = a['wl'][wl].get('length_m') or b['wl'][wl].get('length_m')
+    mask = _interior_mask(pa[:n], length_m=length_m)
+    if mask.sum() < 50:
         return None
     return float(np.std(ta[:n][mask] - tb[:n][mask]))
 
@@ -391,9 +434,24 @@ def build_report(files, all_pairs_list, truth_dups, out_path, title='Duplicate C
     pair_lookup = {tuple(sorted([p['a'], p['b']])): p for p in all_pairs_list}
 
     combined = np.array([p['sum_score'] for p in all_pairs_list], dtype=np.float64)
-    p_dup_arr, prob_stats = _outlier_probability(combined)
-    for p, pd, z in zip(all_pairs_list, p_dup_arr, prob_stats['z']):
+    p_dup_sigma_arr, prob_stats = _outlier_probability(combined)
+    # Pearson-shape contribution: r ≥ 0.99 → 1.0,  r ≤ 0.95 → 0,  linear in between.
+    # This catches short-fiber duplicates that look noisy in σ but match in shape.
+    def _r_to_p(r):
+        if r is None:
+            return 0.0
+        if r >= 0.99:
+            return 1.0
+        if r <= 0.95:
+            return 0.0
+        return float((r - 0.95) / 0.04)
+    p_dup_r_arr = np.array([_r_to_p(p.get('r_min')) for p in all_pairs_list],
+                           dtype=np.float64)
+    # Combined likelihood = max of σ-outlier and shape-correlation tiers.
+    p_dup_arr = np.maximum(p_dup_sigma_arr, p_dup_r_arr)
+    for p, pd, pdr, z in zip(all_pairs_list, p_dup_arr, p_dup_r_arr, prob_stats['z']):
         p['p_dup'] = float(pd)
+        p['p_dup_r'] = float(pdr)
         p['z'] = float(z)
 
     best_partner = {}
@@ -704,6 +762,53 @@ def build_json_html(folder, title='Duplicate Classification Report', truth_dups=
 
 def run_json_bytes(folder, title='Duplicate Classification Report', truth_dups=None):
     html, files, pairs = build_json_html(folder, title=title, truth_dups=truth_dups)
+    return html_to_pdf_bytes(html, base_url=folder), len(files), len(pairs)
+
+
+def build_trc_html(folder, title='Duplicate Classification Report', truth_dups=None):
+    """TRC-mode equivalent of build_json_html. Loads .trc files via the TRC
+    parser and reuses the JSON-mode renderer (same multi-wavelength layout)."""
+    global WL_ORDER
+    paths = sorted(glob.glob(os.path.join(folder, '*.trc')))
+    if not paths:
+        raise RuntimeError(f'No TRC files found in {folder}')
+    files = [load_trc_file(p) for p in paths]
+    # Use whichever wavelengths the TRC files actually carry — fall back to
+    # the production set if everything matches it.
+    common = set(files[0]['wl'].keys())
+    for f in files[1:]:
+        common &= set(f['wl'].keys())
+    wl_list = sorted(common) or WL_ORDER
+    all_pairs = []
+    for a, b in combinations(files, 2):
+        sc = {wl: _score(a, b, wl) for wl in wl_list}
+        rs = {wl: _shape_r(a, b, wl) for wl in wl_list}
+        sum_sc = sum(v for v in sc.values() if v is not None)
+        rs_vals = [v for v in rs.values() if v is not None]
+        r_min = min(rs_vals) if rs_vals else None
+        is_dup = tuple(sorted([a['name'], b['name']])) in (truth_dups or set())
+        all_pairs.append({'a': a['name'], 'b': b['name'],
+                          'score': sc, 'sum_score': sum_sc, 'is_dup': is_dup,
+                          'shape_r': rs, 'r_min': r_min})
+    # Override module-level WL_ORDER for rendering when TRC carries fewer/other λ
+    saved = WL_ORDER
+    WL_ORDER = wl_list
+    out_html_tmp = os.path.join(folder, '_tmp_report.html')
+    try:
+        build_report(files, all_pairs, truth_dups or set(), out_html_tmp, title=title)
+        with open(out_html_tmp, 'r', encoding='utf-8') as fh:
+            html = fh.read()
+    finally:
+        WL_ORDER = saved
+        try:
+            os.remove(out_html_tmp)
+        except OSError:
+            pass
+    return html, files, all_pairs
+
+
+def run_trc_bytes(folder, title='Duplicate Classification Report', truth_dups=None):
+    html, files, pairs = build_trc_html(folder, title=title, truth_dups=truth_dups)
     return html_to_pdf_bytes(html, base_url=folder), len(files), len(pairs)
 
 
