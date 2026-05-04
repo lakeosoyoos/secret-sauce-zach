@@ -385,6 +385,109 @@ def parse_sor(filepath, trim=True):
     return trace[si:ei + 1]
 
 
+def _read_cstr(raw, offset):
+    end = raw.find(b'\x00', offset)
+    if end < 0:
+        return '', offset
+    try:
+        s = raw[offset:end].decode('latin-1', errors='replace').strip()
+    except Exception:
+        s = ''
+    return s, end + 1
+
+
+def parse_sup_params(filepath):
+    """Read the SOR SupParams block (supplier + OTDR mainframe/module IDs).
+
+    Returns a dict with whatever could be read (empty strings otherwise):
+    supplier_name, otdr_mainframe_id, otdr_mainframe_sn, otdr_module_id,
+    otdr_module_sn, software_rev, otdr_other.
+    """
+    with open(filepath, 'rb') as f:
+        raw = f.read()
+    marker = b'SupParams\x00'
+    i = raw.find(marker, 50)
+    if i < 0:
+        return {}
+    p = i + len(marker)
+    out = {}
+    for key in ('supplier_name', 'otdr_mainframe_id', 'otdr_mainframe_sn',
+                'otdr_module_id', 'otdr_module_sn', 'software_rev',
+                'otdr_other'):
+        s, p = _read_cstr(raw, p)
+        out[key] = s
+    return out
+
+
+def _otdr_serial_from_sup(sup):
+    """Pick the most useful OTDR serial. Prefers mainframe SN, falls back to module SN."""
+    for key in ('otdr_mainframe_sn', 'otdr_module_sn'):
+        v = (sup.get(key) or '').strip()
+        if v:
+            return v
+    return ''
+
+
+def parse_gen_params(filepath):
+    """Pull route-level metadata from the SOR GenParams block.
+
+    Returns a dict with whatever could be read (empty strings otherwise):
+    cable_id, fiber_id, fiber_type_code, wavelength_code, location_a,
+    location_b, cable_code, build_condition, operator, comment,
+    serial_number (from SupParams).
+    """
+    with open(filepath, 'rb') as f:
+        raw = f.read()
+    marker = b'GenParams\x00'
+    i = raw.find(marker, 50)
+    if i < 0:
+        return {}
+    p = i + len(marker)
+    # Telcordia SR-4731: language code (2 bytes) then strings in order.
+    p += 2
+    out = {}
+    for key in ('cable_id', 'fiber_id', 'fiber_type_code',
+                'wavelength_code', 'location_a', 'location_b',
+                'cable_code', 'build_condition'):
+        if key in ('fiber_type_code', 'wavelength_code'):
+            if p + 2 <= len(raw):
+                out[key] = struct.unpack_from('<H', raw, p)[0]
+                p += 2
+            continue
+        s, p = _read_cstr(raw, p)
+        out[key] = s
+    # two 4-byte offsets (user offset + distance)
+    p += 8
+    for key in ('operator', 'comment'):
+        s, p = _read_cstr(raw, p)
+        out[key] = s
+    out['serial_number'] = _otdr_serial_from_sup(parse_sup_params(filepath))
+    return out
+
+
+def direction_key_from_genparams(filepath):
+    """Build a stable grouping key from a SOR file's internal metadata.
+
+    Priority order (best signal first):
+      1. (location_a, location_b)            — explicit endpoints
+      2. (operator, otdr_serial)             — crew + OTDR identity
+      3. otdr_serial                         — OTDR alone
+      4. ''                                  — caller should fall back to filename
+    """
+    gp = parse_gen_params(filepath)
+    a = (gp.get('location_a') or '').strip()
+    b = (gp.get('location_b') or '').strip()
+    if a and b:
+        return f'{a}__{b}'
+    op = (gp.get('operator') or '').strip()
+    sn = (gp.get('serial_number') or '').strip()
+    if op and sn:
+        return f'{op}__sn{sn}'
+    if sn:
+        return f'sn{sn}'
+    return ''
+
+
 def parse_sor_full(filepath, trim=True):
     with open(filepath, 'rb') as f:
         data = f.read()

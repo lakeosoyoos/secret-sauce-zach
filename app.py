@@ -22,6 +22,7 @@ sys.path.insert(0, HERE)
 
 from report import run_json_bytes, run_trc_bytes
 from report_sor import run_sor_bytes
+from sor_reader324802a import direction_key_from_genparams
 
 
 st.set_page_config(
@@ -133,17 +134,34 @@ if n_kinds > 1:
 st.success(f"Loaded {len(sor_files)} SOR + {len(trc_files)} TRC + {len(json_files)} JSON file(s).")
 
 
-# ----- SOR: group by direction prefix ----------------------------------
-def _direction_prefix(filename):
+# ----- SOR: group by file-internal direction signal --------------------
+# Read GenParams from each SOR (location_a/b → operator+OTDR serial → OTDR
+# serial). Filename is only used as a last-resort fallback when the file
+# carries no useful metadata. Two files end up in the same group iff they
+# share the same direction key — i.e. they were shot from the same end of
+# the cable with the same OTDR.
+_FILENAME_PREFIX_RE = re.compile(r"^(.*?)sh\d+", re.IGNORECASE)
+
+
+def _filename_fallback_key(filename):
     base = os.path.basename(filename)
-    m = re.match(r"^(.*?)sh\d+", base, flags=re.IGNORECASE)
+    m = _FILENAME_PREFIX_RE.match(base)
     return (m.group(1) if m else "group").rstrip("-_ ") or "group"
+
+
+def _direction_key(filepath):
+    """Resolve the grouping key from inside the SOR. Falls back to the
+    filename prefix only if GenParams carries nothing usable."""
+    key = direction_key_from_genparams(filepath)
+    if key:
+        return key
+    return _filename_fallback_key(filepath)
 
 
 def _group_sor(paths):
     groups = defaultdict(list)
     for p in paths:
-        groups[_direction_prefix(p)].append(p)
+        groups[_direction_key(p)].append(p)
     return {k: v for k, v in groups.items() if len(v) >= 2}
 
 
