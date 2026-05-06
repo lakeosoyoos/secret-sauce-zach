@@ -468,24 +468,32 @@ def parse_gen_params(filepath):
 def direction_key_from_genparams(filepath):
     """Build a stable grouping key from a SOR file's internal metadata.
 
-    Priority order (best signal first):
-      1. (location_a, location_b)            — explicit endpoints
-      2. (operator, otdr_serial)             — crew + OTDR identity
-      3. otdr_serial                         — OTDR alone
-      4. ''                                  — caller should fall back to filename
+    The key is a compound of every present signal so that pairs that share
+    a label but differ in OTDR (the typical bidirectional setup where each
+    end has its own OTDR) end up in separate groups:
+
+      location_a → location_b   (when both populated)
+      operator                   (when populated)
+      OTDR serial number         (always preferred over operator alone)
+
+    Returns '' when the file carries nothing useful — caller should fall
+    back to the filename in that case.
     """
     gp = parse_gen_params(filepath)
     a = (gp.get('location_a') or '').strip()
     b = (gp.get('location_b') or '').strip()
-    if a and b:
-        return f'{a}__{b}'
     op = (gp.get('operator') or '').strip()
     sn = (gp.get('serial_number') or '').strip()
+    parts = []
+    if a or b:
+        parts.append(f'{a}_to_{b}')
     if op and sn:
-        return f'{op}__sn{sn}'
-    if sn:
-        return f'sn{sn}'
-    return ''
+        parts.append(f'{op}_sn{sn}')
+    elif sn:
+        parts.append(f'sn{sn}')
+    elif op:
+        parts.append(op)
+    return '__'.join(parts)
 
 
 def parse_sor_full(filepath, trim=True):
